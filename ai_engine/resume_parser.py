@@ -1,44 +1,66 @@
-import os
+import sys
+from pathlib import Path
+
+# Add project root to sys.path if run directly
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 import json
 import fitz  # PyMuPDF
 import requests
-from pathlib import Path
+from typing import List, Optional
+from pydantic import BaseModel, Field
 
-import time
-from functools import wraps
+from config import config
 
-def time_it(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        result = func(*args, **kwargs)
-        end = time.perf_counter()
-        print(f"Execution time for {func.__name__}: {end - start:.6f} seconds")
-        return result
-    return wrapper
+# --- Define Pydantic Schemas for the Output ---
+class PersonalInfo(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    linkedin: Optional[str] = Field(None, description="LinkedIn URL/username")
+    github: Optional[str] = Field(None, description="GitHub URL/username")
+    portfolio: Optional[str] = Field(None, description="Portfolio URL")
 
+class Education(BaseModel):
+    degree: str
+    institution: str
+    year: str
+
+class Experience(BaseModel):
+    job_title: str
+    company: str
+    duration: str
+    description: str
+
+class Project(BaseModel):
+    project_title: str
+    description: str
+
+class Certification(BaseModel):
+    certificate_name: str
+    description: str
+
+class Language(BaseModel):
+    language_name: Optional[str] = None
+    proficiency: Optional[str] = None
+
+class ResumeSchema(BaseModel):
+    personal_info: PersonalInfo
+    experience_summary: Optional[str] = None
+    skills: List[str]
+    education: List[Education]
+    experience: List[Experience]
+    projects: List[Project]
+    certification: List[Certification]
+    language: List[Language]
 
 class ResumeParser:
-    def __init__(self, ollama_url="http://localhost:11434", model="qwen2.5:1.5b"):
-        self.ollama_url = ollama_url
-        self.model = model
-        self.schema = {
-            "personal_info": {
-                "first_name": "string or null",
-                "last_name": "string or null",
-                "email": "string or null",
-                "phone": "string or null",
-                "linkedin": "string or null",
-                "github": "string or null",
-                "portfolio": "string or null"
-            },
-            "experience_summary": "string or null",
-            "skills": ["array of strings"],
-            "education": [{"degree": "string", "institution": "string", "year": "string"}],
-            "experience": [{"job_title": "string", "company": "string", "duration": "string", "description": "string"}],
-            "projects" : [{"project_title": "string", "description": "string"}],
-            "Certification" : [{"certificate_name": "string", "description": "string"}]
-        }
+    def __init__(self):
+        self.ollama_url = config.OLLAMA_BASE_URL
+        self.model = config.DEFAULT_MODEL
 
     def extract_text_from_pdf(self, pdf_path):
         """Extracts raw text from the provided PDF file."""
@@ -52,61 +74,51 @@ class ResumeParser:
         except Exception as e:
             print(f"[!] Error reading PDF: {e}")
             return None
-    @time_it
-    def _call_ollama(self, prompt):
-        """Calls the local Ollama instance and forces JSON output."""
-        print(f"[*] Sending text to local AI ({self.model}) for extraction...")
+
+    def _call_ollama(self, prompt, schema_class):
+        """Calls the local Ollama instance with structured output."""
+        print(f"[*] Sending text to local AI ({self.model}) at {self.ollama_url} for extraction...")
         url = f"{self.ollama_url}/api/generate"
         
         payload = {
             "model": self.model,
             "prompt": prompt,
             "stream": False,
-            "format": "json" # CRITICAL: Forces the model to return valid JSON
+            # Pass the Pydantic schema as a JSON schema parameter
+            "format": schema_class.model_json_schema() 
         }
         
         try:
             response = requests.post(url, json=payload)
             response.raise_for_status()
-            return response.json().get("response", "{}")
+            ai_response = response.json().get("response", "{}")
+            return ai_response
         except requests.exceptions.RequestException as e:
             print(f"[!] Ollama API Error: {e}")
             return "{}"
 
-    @time_it
     def parse_resume(self, text):
         """Constructs the prompt and extracts structured data using AI."""
         prompt = f"""
-        You are a highly accurate HR data extraction AI. Your task is to parse resume text and convert all relevant information into a structured JSON object that strictly follows the provided schema.
-
-        Instructions:
-        1. Extract information only from the provided resume text.
-        2. Populate every field defined in the schema.
-        3. If a field is not present in the resume, set its value to null.
-        4. Do not infer or fabricate information that is not explicitly stated.
-        5. Preserve the schema structure exactly (keys, nesting, and data types).
-        6. Lists in the schema must always be returned as arrays (even if they contain only one item).
-        7. Dates should be returned exactly as written in the resume unless the schema specifies a format.
-        8. Remove extra whitespace and normalize text where appropriate.
-        9. Return ONLY valid JSON. Do not include explanations, comments, markdown, or additional text.
-
-        JSON Schema:
-        {json.dumps(self.schema, indent=2)}
-
+        You are an expert HR data extraction AI. Read the following resume text and extract the information.
+        If a specific piece of information is missing from the resume, you MUST set its value to null.
+        
         Resume Text:
         {text}
-
-        Output:
-        Return a single valid JSON object that strictly matches the schema above.
         """
         
-        raw_json = self._call_ollama(prompt)
+        raw_json = self._call_ollama(prompt, ResumeSchema)
         
         try:
             parsed_data = json.loads(raw_json)
+            # Optional: Validate via Pydantic model
+            # validated_obj = ResumeSchema(**parsed_data)
             return parsed_data
         except json.JSONDecodeError:
             print("[!] AI failed to return valid JSON.")
+            return {}
+        except Exception as e:
+            print(f"[!] Validation Error: {e}")
             return {}
 
     def log_missing_fields(self, data, parent_key=""):
@@ -128,10 +140,9 @@ class ResumeParser:
 
     def process_pdf(self, resume_name):
         """Main pipeline to convert a PDF to a saved Profile JSON."""
-        # Setup paths based on standard structure
-        base_dir = Path(__file__).parent.parent
-        pdf_path = base_dir / "assets" / "resume" / f"{resume_name}.pdf"
-        output_path = base_dir / "assets" / "profiles" / f"profile_{resume_name}.json"
+        
+        pdf_path = config.RESUME_DIR / f"{resume_name}.pdf"
+        output_path = config.PROFILES_DIR / f"profile_{resume_name}.json"
 
         if not pdf_path.exists():
             print(f"[!] Resume not found at {pdf_path}")
@@ -155,7 +166,6 @@ class ResumeParser:
             print("\n[+] All schema fields were successfully extracted!")
 
         # 4. Save to JSON
-        os.makedirs(output_path.parent, exist_ok=True)
         with open(output_path, "w") as f:
             json.dump(profile_data, f, indent=4)
             
@@ -163,4 +173,4 @@ class ResumeParser:
 
 if __name__ == "__main__":
     parser = ResumeParser()
-    parser.process_pdf(input("Enter Resume Name: "))
+    parser.process_pdf(input("Enter Resume Name (without .pdf): "))
